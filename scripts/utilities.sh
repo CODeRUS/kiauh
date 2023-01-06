@@ -350,6 +350,12 @@ function find_klipper_systemd() {
   echo "${services}"
 }
 
+function find_klipper_systemd_instances() {
+  local services
+  services=$(find "${SYSTEMD}/multi-user.target.wants" -maxdepth 1 -name "klipper@*" | sort)
+  echo "${services}"
+}
+
 function create_required_folders() {
   local printer_data=${1} folders
   folders=("backup" "certs" "config" "database" "gcodes" "comms" "logs" "systemd")

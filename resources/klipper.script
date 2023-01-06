@@ -1,0 +1,3 @@
+#!/bin/bash
+
+%ENV%/bin/python /home/%USER%/klipper/klippy/klippy.py %CFG% -I %PRINTER% -l %LOG% -a %UDS%

@@ -42,7 +42,7 @@ function start_klipper_setup() {
     error="${error}\n Please re-install Klipper with KIAUH!"
     log_info "Unsupported Klipper SysVinit service detected: ${klipper_initd_service}"
   elif [[ -n ${klipper_systemd_services} ]]; then
-    error="At least one Klipper service is already installed:"
+    error="At least one old Klipper service is already installed:"
 
     for s in ${klipper_systemd_services}; do
       log_info "Found Klipper service: ${s}"
@@ -54,7 +54,7 @@ function start_klipper_setup() {
   ### user selection for python version
   print_dialog_user_select_python_version
   while true; do
-    read -p "${cyan}###### Select Python version:${white} " input
+    read -p "${cyan}###### Select Python version:${white} " -e -i "1" input
     case "${input}" in
       1)
         select_msg "Python 3.x\n"
@@ -121,13 +121,26 @@ function start_klipper_setup() {
     while [[ ! ${input} =~ ${regex} || ${i} -le ${instance_count} ]]; do
       read -p "${cyan}###### Name for instance #${i}:${white} " input
 
+      local instance_name
       if [[ ${input} =~ ${regex} ]]; then
         select_msg "Name: ${input}\n"
         if [[ ${input} =~ ^[0-9]+$ ]]; then
-          instance_names+=("printer_${input}")
+          instance_name=("printer_${input}")
         else
-          instance_names+=("${input}")
+          instance_name=("${input}")
         fi
+
+        if [[ -d ${HOME}/${instance_name}_data ]]
+        then
+          echo "Instance name ${instance_name} already being used!"
+          read -p "Enter q to exit or Enter to continue: " decision
+          if [[ ${decision} == "q" ]]
+          then
+            return
+          fi
+        fi
+        instance_names+=("${instance_name}")
+
         i=$(( i + 1 ))
       else
         error_msg "Invalid Input!\n"
@@ -204,17 +217,13 @@ function run_klipper_setup() {
   install_klipper_packages "${python_version}"
   create_klipper_virtualenv "${python_version}"
 
-  ### step 3: create klipper instances
+  ### step 3: check for dialout group membership
+  check_usergroups
+
+  ### step 4: create klipper instances
   for instance in "${instance_names[@]}"; do
     create_klipper_service "${instance}"
   done
-
-  ### step 4: enable and start all instances
-  do_action_service "enable" "klipper"
-  do_action_service "start" "klipper"
-
-  ### step 5: check for dialout group membership
-  check_usergroups
 
   ### confirm message
   (( ${#instance_names[@]} == 1 )) && confirm="Klipper has been set up!"
@@ -232,6 +241,22 @@ function clone_klipper() {
   [[ -z ${repo} ]] && repo="${KLIPPER_REPO}"
   repo=$(echo "${repo}" | sed -r "s/^(http|https):\/\/github\.com\///i; s/\.git$//")
   repo="https://github.com/${repo}"
+
+  local clean=0
+  if [[ -d ${KLIPPER_DIR} ]]
+  then
+    status_msg "Klipper already cloned, checking compatibility ..."
+    local current_repo=$(git -C ${KLIPPER_DIR} config --get remote.origin.url)
+    if [[ "${repo}" != "${current_repo}" ]]
+    then
+      clean=1
+    else
+      git -C ${KLIPPER_DIR} stash
+      git -C ${KLIPPER_DIR} checkout ${branch}
+      git -C ${KLIPPER_DIR} pull --ff-only
+      return
+    fi
+  fi
 
   [[ -z ${branch} ]] && branch="master"
 
@@ -319,6 +344,8 @@ function install_klipper_packages() {
 function create_klipper_service() {
   local instance_name=${1}
 
+  echo "Configuring Klipper instance ${instance_name}"
+
   local printer_data
   local cfg_dir
   local cfg
@@ -329,7 +356,6 @@ function create_klipper_service() {
   local service
   local service_template
   local env_template
-  local suffix
 
   printer_data="${HOME}/${instance_name}_data"
   cfg_dir="${printer_data}/config"
@@ -337,27 +363,22 @@ function create_klipper_service() {
   log="${printer_data}/logs/klippy.log"
   klippy_serial="${printer_data}/comms/klippy.serial"
   klippy_socket="${printer_data}/comms/klippy.sock"
-  env_file="${printer_data}/systemd/klipper.env"
-
-  if [[ ${instance_name} == "printer" ]]; then
-    suffix="${instance_name//printer/}"
-  else
-    suffix="-${instance_name//printer_/}"
-  fi
+  script_file="${printer_data}/systemd/klipper.script"
 
   create_required_folders "${printer_data}"
 
   service_template="${KIAUH_SRCDIR}/resources/klipper.service"
-  env_template="${KIAUH_SRCDIR}/resources/klipper.env"
-  service="${SYSTEMD}/klipper${suffix}.service"
+  script_template="${KIAUH_SRCDIR}/resources/klipper.script"
+  service="${SYSTEMD}/klipper@.service"
 
   if [[ ! -f ${service} ]]; then
     status_msg "Create Klipper service file ..."
 
     sudo cp "${service_template}" "${service}"
-    sudo cp "${env_template}" "${env_file}"
-    sudo sed -i "s|%USER%|${USER}|g; s|%ENV%|${KLIPPY_ENV}|; s|%ENV_FILE%|${env_file}|" "${service}"
-    sudo sed -i "s|%USER%|${USER}|; s|%LOG%|${log}|; s|%CFG%|${cfg}|; s|%PRINTER%|${klippy_serial}|; s|%UDS%|${klippy_socket}|" "${env_file}"
+    sudo cp "${script_template}" "${script_file}"
+    sudo sed -i "s|%USER%|${USER}|g" "${service}"
+    sudo sed -i "s|%ENV%|${KLIPPY_ENV}|; s|%USER%|${USER}|; s|%LOG%|${log}|; s|%CFG%|${cfg}|; s|%PRINTER%|${klippy_serial}|; s|%UDS%|${klippy_socket}|" "${script_file}"
+    sudo chmod +x "${script_file}"
 
     ok_msg "Klipper service file created!"
   fi
@@ -365,6 +386,9 @@ function create_klipper_service() {
   if [[ ! -f ${cfg} ]]; then
     write_example_printer_cfg "${cfg}"
   fi
+
+  sudo systemctl enable klipper@${instance_name}
+  sudo systemctl start klipper@${instance_name}
 }
 
 function write_example_printer_cfg() {
@@ -386,27 +410,24 @@ function write_example_printer_cfg() {
 #================================================#
 
 function remove_klipper_service() {
-  if [[ ! -e "${INITD}/klipper" ]] && [[ -z $(find_klipper_systemd) ]]; then
-    return
-  fi
-
   status_msg "Removing Klipper services ..."
 
   if [[ -e "${INITD}/klipper" ]]; then
     sudo systemctl stop klipper
     sudo update-rc.d -f klipper remove
     sudo rm -f "${INITD}/klipper" "${ETCDEF}/klipper"
-  else
-    for service in $(find_klipper_systemd | cut -d"/" -f5); do
-      status_msg "Removing ${service} ..."
-      sudo systemctl stop "${service}"
-      sudo systemctl disable "${service}"
-      sudo rm -f "${SYSTEMD}/${service}"
-      sudo systemctl daemon-reload
-      sudo systemctl reset-failed
-    done
   fi
 
+  for service in $(find_klipper_systemd | cut -d"/" -f5); do
+    status_msg "Removing ${service} ..."
+    sudo systemctl stop "${service}"
+    sudo systemctl disable "${service}"
+    sudo rm -f "${SYSTEMD}/${service}"
+  done
+
+  sudo systemctl daemon-reload
+  sudo systemctl reset-failed
+ 
   ok_msg "All Klipper services removed!"
 }
 
@@ -469,27 +490,104 @@ function remove_files() {
   if (( ${#files[@]} > 0 )); then
     for file in "${files[@]}"; do
       status_msg "Removing ${file} ..."
-      rm -f "${file}"
+      sudo rm -f "${file}"
       ok_msg "${file} removed!"
     done
   fi
 }
 
-function remove_klipper() {
-  remove_klipper_service
-  remove_files "$(find_instance_files "systemd" "klipper.env")"
-  remove_files "$(find_instance_files "logs" "klippy.log.*")"
-  remove_files "$(find_instance_files "comms" "klippy.sock")"
-  remove_files "$(find_instance_files "comms" "klippy.serial")"
+function cleanup_klipper() {
+  sudo rm -f "${SYSTEMD}/klipper@.service"
 
-  remove_files "$(find_legacy_klipper_logs)"
-  remove_files "$(find_legacy_klipper_uds)"
-  remove_files "$(find_legacy_klipper_printer)"
+  sudo systemctl daemon-reload
+  sudo systemctl reset-failed
 
   remove_klipper_dir
   remove_klipper_env
+}
 
-  print_confirm "Klipper was successfully removed!" && return
+function remove_klipper_instance() {
+  local instance=${1}
+  local instance_systemd_name=$(basename ${instance})
+  local instance_name=$(echo ${instance_systemd_name} | cut -f 2 -d "@")
+
+  echo "Removing Klipper instance ${instance_name}"
+
+  sudo systemctl stop ${instance_systemd_name}
+  sudo systemctl disable ${instance_systemd_name}
+
+  sudo rm -f ${HOME}/${instance_name}_data/systemd/klipper.env
+  rm -f ${HOME}/${instance_name}_data/logs/klippy.log*
+  rm -f ${HOME}/${instance_name}_data/comms/klippy.sock
+  rm -f ${HOME}/${instance_name}_data/comms/klippy.serial
+}
+
+function remove_klipper() {
+  local klipper_initd_service
+  local klipper_systemd_services
+
+  klipper_initd_service=$(find_klipper_initd)
+  klipper_systemd_services=$(find_klipper_systemd)
+
+  if [[ -n ${klipper_initd_service} ]] || [[ -n ${klipper_systemd_services} ]]; then
+    remove_klipper_service
+    remove_files "$(find_instance_files "systemd" "klipper.env")"
+    remove_files "$(find_instance_files "logs" "klippy.log.*")"
+    remove_files "$(find_instance_files "comms" "klippy.sock")"
+    remove_files "$(find_instance_files "comms" "klippy.serial")"
+
+    remove_files "$(find_legacy_klipper_logs)"
+    remove_files "$(find_legacy_klipper_uds)"
+    remove_files "$(find_legacy_klipper_printer)"
+
+    remove_klipper_dir
+    remove_klipper_env
+
+    print_confirm "Klipper was successfully removed!" && return
+  else
+    local klipper_systemd_instances=$(find_klipper_systemd_instances)
+
+    if [[ -n $klipper_systemd_instances ]]
+    then
+      local klipper_systemd_instances_count="$(find_klipper_systemd_instances | wc -w)"
+
+      if [[ $klipper_systemd_instances_count > 1 ]]
+      then
+        echo "Please select Klipper instance to remove:"
+        echo "0: Remove all"
+        local index=0
+        for instance in $klipper_systemd_instances
+        do
+          ((index=index+1))
+          echo "$index: $(basename $instance)"
+        done
+        while true; do
+          read -p "${cyan}Input:${white} " -e -i "0" input
+          if [[ ${input} < 0 ]] || [[ ${input} > ${index} ]]
+          then
+            error_msg "Invalid Input!\n"
+          fi
+          if [[ ${input} == 0 ]]
+          then
+            for remove_instance in $klipper_systemd_instances
+            do
+              remove_klipper_instance ${remove_instance}
+            done
+            cleanup_klipper
+          else
+            remove_klipper_instance ${klipper_systemd_instances[${input}]}
+          fi
+          break
+        done && input=""
+      else
+        remove_klipper_instance ${klipper_systemd_instances}
+        cleanup_klipper
+      fi
+      print_confirm "Klipper was successfully removed!" && return
+    else
+      echo "No klipper instances found"
+    fi
+  fi
 }
 
 #================================================#
